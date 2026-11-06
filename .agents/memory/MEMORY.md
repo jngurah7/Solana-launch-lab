@@ -1,0 +1,2 @@
+- [Solana Launch Lab safety](solana-launch-lab-safety.md) — Keep wallet access approval-based, trading simulation-only, and market data verifiable.
+- [Expo web root HTML](expo-web-root-html.md) — Custom Expo Router HTML must preserve document nodes so the browser app can hydrate.
