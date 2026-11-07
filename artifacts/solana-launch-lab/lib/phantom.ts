@@ -1,8 +1,12 @@
 import { Platform } from 'react-native';
 import * as Crypto from 'expo-crypto';
 import * as Linking from 'expo-linking';
+import * as SecureStore from 'expo-secure-store';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
+import { decryptPhantomConnectResponse } from './phantom-response';
+
+export { decryptPhantomConnectResponse, hasPhantomResponse } from './phantom-response';
 
 export interface PhantomKeyPair {
   publicKey: Uint8Array;
@@ -37,59 +41,89 @@ function getRedirectUrl(): string {
     return `${window.location.origin}${window.location.pathname}`;
   }
 
-  // Returning to the app root avoids sending Expo Router to an unregistered route.
-  return Linking.createURL('');
+  // A named callback path produces a valid custom-scheme URI on Android and
+  // maps to the app's registered phantom-connect route.
+  return Linking.createURL('phantom-connect');
 }
 
-function storePendingWebKey(keyPair: PhantomKeyPair): void {
-  if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+async function storePendingKeyPair(keyPair: PhantomKeyPair): Promise<void> {
+  const record = JSON.stringify({
+    createdAt: Date.now(),
+    secretKey: bs58.encode(keyPair.secretKey),
+  });
 
-  window.sessionStorage.setItem(
-    PENDING_CONNECT_KEY,
-    JSON.stringify({
-      createdAt: Date.now(),
-      secretKey: bs58.encode(keyPair.secretKey),
-    }),
-  );
+  if (Platform.OS === 'web') {
+    if (typeof window === 'undefined') {
+      throw new Error('Browser storage is unavailable. Please retry the Phantom connection.');
+    }
+    try {
+      window.sessionStorage.setItem(PENDING_CONNECT_KEY, record);
+    } catch {
+      throw new Error('Temporary connection storage is unavailable. Please retry in a standard browser tab.');
+    }
+    return;
+  }
+
+  // This is a short-lived Dapp encryption secret, not a wallet signing key.
+  // Android can recreate the JS runtime while Phantom is in the foreground.
+  await SecureStore.setItemAsync(PENDING_CONNECT_KEY, record);
 }
 
-export function restorePendingPhantomKeyPair(): PhantomKeyPair | null {
-  if (Platform.OS !== 'web' || typeof window === 'undefined') return null;
-
-  const stored = window.sessionStorage.getItem(PENDING_CONNECT_KEY);
+export async function restorePendingPhantomKeyPair(): Promise<PhantomKeyPair | null> {
+  let stored: string | null = null;
+  try {
+    if (Platform.OS === 'web') {
+      if (typeof window === 'undefined') return null;
+      stored = window.sessionStorage.getItem(PENDING_CONNECT_KEY);
+    } else {
+      stored = await SecureStore.getItemAsync(PENDING_CONNECT_KEY);
+    }
+  } catch {
+    return null;
+  }
   if (!stored) return null;
 
   try {
     const record = JSON.parse(stored) as { createdAt?: number; secretKey?: string };
     if (
       typeof record.createdAt !== 'number' ||
+      !Number.isFinite(record.createdAt) ||
+      record.createdAt > Date.now() + 60_000 ||
       Date.now() - record.createdAt > PENDING_CONNECT_TTL_MS ||
       typeof record.secretKey !== 'string'
     ) {
-      clearPendingPhantomKeyPair();
+      await clearPendingPhantomKeyPair();
       return null;
     }
 
     const secretKey = bs58.decode(record.secretKey);
     if (secretKey.length !== nacl.box.secretKeyLength) {
-      clearPendingPhantomKeyPair();
+      await clearPendingPhantomKeyPair();
       return null;
     }
 
     return nacl.box.keyPair.fromSecretKey(secretKey);
   } catch {
-    clearPendingPhantomKeyPair();
+    await clearPendingPhantomKeyPair();
     return null;
   }
 }
 
-export function clearPendingPhantomKeyPair(): void {
-  if (Platform.OS === 'web' && typeof window !== 'undefined') {
+export async function clearPendingPhantomKeyPair(): Promise<void> {
+  if (Platform.OS === 'web') {
+    if (typeof window === 'undefined') return;
     try {
       window.sessionStorage.removeItem(PENDING_CONNECT_KEY);
     } catch {
-      // A restricted browser storage context must not block clearing in-memory state.
+      console.warn('Could not clear the temporary Phantom callback key from browser storage.');
     }
+    return;
+  }
+
+  try {
+    await SecureStore.deleteItemAsync(PENDING_CONNECT_KEY);
+  } catch {
+    console.warn('Could not clear the temporary Phantom callback key from secure storage.');
   }
 }
 
@@ -102,9 +136,9 @@ export async function createPhantomConnectRequest(): Promise<{
   const secretKey = await Crypto.getRandomBytesAsync(nacl.box.secretKeyLength);
   const keyPair = nacl.box.keyPair.fromSecretKey(secretKey);
 
-  // On the web, sessionStorage allows this short-lived app-to-wallet key to
-  // survive Phantom's browser redirect. It is removed after the response.
-  storePendingWebKey(keyPair);
+  // Keep only the one-time encryption key long enough to decrypt Phantom's
+  // approval after Android resumes or recreates the app process.
+  await storePendingKeyPair(keyPair);
 
   const query = encodeQuery({
     app_url: appUrl,
@@ -117,77 +151,4 @@ export async function createPhantomConnectRequest(): Promise<{
     keyPair,
     url: `${PHANTOM_CONNECT_URL}?${query}`,
   };
-}
-
-export function hasPhantomResponse(url: string): boolean {
-  try {
-    const params = new URL(url).searchParams;
-    return params.has('data') || params.has('errorCode');
-  } catch {
-    return false;
-  }
-}
-
-export function decryptPhantomConnectResponse(
-  url: string,
-  keyPair: PhantomKeyPair,
-): string {
-  const params = new URL(url).searchParams;
-  const errorCode = params.get('errorCode');
-  if (errorCode) {
-    const message = params.get('errorMessage');
-    throw new Error(
-      message ? `Phantom declined the request: ${message}` : `Phantom declined the request (${errorCode}).`,
-    );
-  }
-
-  const phantomPublicKey = params.get('phantom_encryption_public_key');
-  const encryptedData = params.get('data');
-  const nonceValue = params.get('nonce');
-  if (!phantomPublicKey || !encryptedData || !nonceValue) {
-    throw new Error('Phantom returned an incomplete connection response. Please try again.');
-  }
-
-  const phantomKeyBytes = bs58.decode(phantomPublicKey);
-  const nonce = bs58.decode(nonceValue);
-  if (
-    phantomKeyBytes.length !== nacl.box.publicKeyLength ||
-    nonce.length !== nacl.box.nonceLength
-  ) {
-    throw new Error('Phantom returned invalid encryption data. Please start a new connection.');
-  }
-
-  const sharedSecret = nacl.box.before(phantomKeyBytes, keyPair.secretKey);
-  const cleartext = nacl.box.open.after(
-    bs58.decode(encryptedData),
-    nonce,
-    sharedSecret,
-  );
-  if (!cleartext) {
-    throw new Error('The Phantom response could not be authenticated. Please reconnect.');
-  }
-
-  let response: unknown;
-  try {
-    response = JSON.parse(String.fromCharCode(...cleartext));
-  } catch {
-    throw new Error('Phantom returned an unreadable connection response. Please reconnect.');
-  }
-
-  if (
-    typeof response !== 'object' ||
-    response === null ||
-    !('public_key' in response) ||
-    typeof response.public_key !== 'string'
-  ) {
-    throw new Error('Phantom did not return a wallet address.');
-  }
-
-  const publicKeyBytes = bs58.decode(response.public_key);
-  if (publicKeyBytes.length !== 32) {
-    throw new Error('Phantom returned an invalid Solana wallet address.');
-  }
-
-  // The session token is intentionally ignored; this screen never requests signatures.
-  return response.public_key;
 }

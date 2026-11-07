@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   ActivityIndicator,
   Image,
   Platform,
@@ -26,6 +27,11 @@ import {
   type PhantomKeyPair,
 } from '@/lib/phantom';
 import { getDevnetBalance } from '@/lib/solana-devnet';
+import {
+  clearSavedWalletAddress,
+  loadSavedWalletAddress,
+  saveWalletAddress,
+} from '@/lib/wallet-storage';
 
 type BusyAction = 'connect' | 'balance' | 'airdrop' | null;
 type NoticeTone = 'info' | 'success' | 'error';
@@ -43,70 +49,136 @@ export default function WalletDevnetScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const pendingKeyPair = useRef<PhantomKeyPair | null>(null);
+  const handledCallbackUrl = useRef<string | null>(null);
+  const callbackSeen = useRef(false);
+  const balanceRequestId = useRef(0);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [walletVerified, setWalletVerified] = useState(false);
   const [balance, setBalance] = useState<number | null>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [incomingUrl, setIncomingUrl] = useState<string | null>(null);
 
   const loadBalance = useCallback(async (address: string) => {
+    const requestId = ++balanceRequestId.current;
     setBusy('balance');
     try {
       const nextBalance = await getDevnetBalance(address);
-      setBalance(nextBalance);
-      setNotice({ tone: 'success', text: 'Devnet balance refreshed from Solana RPC.' });
+      if (requestId === balanceRequestId.current) {
+        setBalance(nextBalance);
+        setNotice({ tone: 'success', text: 'Devnet balance refreshed from Solana RPC.' });
+      }
     } catch (error) {
-      setNotice({
-        tone: 'error',
-        text: error instanceof Error ? error.message : 'Could not load the Devnet balance.',
-      });
+      if (requestId === balanceRequestId.current) {
+        setNotice({
+          tone: 'error',
+          text: error instanceof Error ? error.message : 'Could not load the Devnet balance.',
+        });
+      }
     } finally {
-      setBusy(null);
+      if (requestId === balanceRequestId.current) setBusy(null);
     }
   }, []);
 
-  const clearPendingKey = useCallback(() => {
+  const clearPendingKey = useCallback(async () => {
     pendingKeyPair.current?.secretKey.fill(0);
     pendingKeyPair.current = null;
-    clearPendingPhantomKeyPair();
+    await clearPendingPhantomKeyPair();
+  }, []);
+
+  const queueCallbackUrl = useCallback((url: string | null) => {
+    if (!url || !hasPhantomResponse(url)) return;
+    callbackSeen.current = true;
+    setIncomingUrl(url);
   }, []);
 
   useEffect(() => {
-    const subscription = Linking.addEventListener('url', ({ url }) => {
-      if (hasPhantomResponse(url)) setIncomingUrl(url);
+    let mounted = true;
+    const checkInitialUrl = () => {
+      void Linking.getInitialURL()
+        .then((url) => {
+          if (mounted) queueCallbackUrl(url);
+        })
+        .catch((error: unknown) => {
+          console.warn('Could not read the Phantom callback URL.', error);
+        });
+    };
+
+    const subscription = Linking.addEventListener('url', ({ url }) => queueCallbackUrl(url));
+    const appStateSubscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') checkInitialUrl();
     });
 
-    void Linking.getInitialURL()
-      .then((url) => {
-        if (url && hasPhantomResponse(url)) setIncomingUrl(url);
-      })
-      .catch((error: unknown) => {
-        console.warn('Could not read the initial wallet callback URL.', error);
-      });
+    checkInitialUrl();
 
     if (Platform.OS === 'web' && typeof window !== 'undefined' && hasPhantomResponse(window.location.href)) {
-      setIncomingUrl(window.location.href);
+      queueCallbackUrl(window.location.href);
     }
 
-    return () => subscription.remove();
-  }, []);
+    return () => {
+      mounted = false;
+      subscription.remove();
+      appStateSubscription.remove();
+    };
+  }, [queueCallbackUrl]);
+
+  useEffect(() => {
+    let mounted = true;
+    const restoreSavedAddress = async () => {
+      try {
+        const address = await loadSavedWalletAddress();
+        if (!address || !mounted || callbackSeen.current) return;
+
+        setWalletAddress(address);
+        setWalletVerified(false);
+        await loadBalance(address);
+        if (mounted && !callbackSeen.current) {
+          setNotice({
+            tone: 'info',
+            text: 'Saved wallet restored for Devnet reads. Reconnect to confirm Phantom approval.',
+          });
+        }
+      } catch (error) {
+        if (mounted) {
+          setNotice({
+            tone: 'error',
+            text: error instanceof Error ? error.message : 'Could not restore the saved wallet address.',
+          });
+        }
+      }
+    };
+
+    void restoreSavedAddress();
+    return () => {
+      mounted = false;
+    };
+  }, [loadBalance]);
 
   useEffect(() => {
     if (!incomingUrl) return;
+    if (handledCallbackUrl.current === incomingUrl) {
+      setIncomingUrl(null);
+      return;
+    }
+    handledCallbackUrl.current = incomingUrl;
 
     const processResponse = async () => {
       try {
-        const keyPair = pendingKeyPair.current ?? restorePendingPhantomKeyPair();
+        const keyPair = pendingKeyPair.current ?? await restorePendingPhantomKeyPair();
         if (!keyPair) {
-          throw new Error('The temporary connection expired. Please connect to Phantom again.');
+          throw new Error('The temporary Android callback expired. Please reconnect to Phantom.');
         }
         pendingKeyPair.current = keyPair;
 
         const address = decryptPhantomConnectResponse(incomingUrl, keyPair);
-        clearPendingKey();
         setWalletAddress(address);
+        setWalletVerified(true);
         setBalance(null);
         setNotice({ tone: 'success', text: 'Phantom connected. This screen is read-only.' });
+        await clearPendingKey();
+        await saveWalletAddress(address).catch((error: unknown) => {
+          console.warn('Could not save the public wallet address locally.', error);
+        });
 
         if (Platform.OS === 'web' && typeof window !== 'undefined') {
           window.history.replaceState({}, '', window.location.pathname);
@@ -115,7 +187,8 @@ export default function WalletDevnetScreen() {
         await loadBalance(address);
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } catch (error) {
-        clearPendingKey();
+        await clearPendingKey();
+        setWalletVerified(false);
         setNotice({
           tone: 'error',
           text: error instanceof Error ? error.message : 'Could not complete the Phantom connection.',
@@ -130,9 +203,10 @@ export default function WalletDevnetScreen() {
 
   const connectWallet = async () => {
     setBusy('connect');
+    setWalletVerified(false);
     setNotice(null);
     try {
-      clearPendingKey();
+      await clearPendingKey();
       const request = await createPhantomConnectRequest();
       pendingKeyPair.current = request.keyPair;
       await Haptics.selectionAsync();
@@ -142,7 +216,7 @@ export default function WalletDevnetScreen() {
         text: 'Review the connection request in Phantom. Your wallet must approve it.',
       });
     } catch (error) {
-      clearPendingKey();
+      await clearPendingKey();
       setNotice({
         tone: 'error',
         text: error instanceof Error ? error.message : 'Could not open Phantom.',
@@ -186,9 +260,13 @@ export default function WalletDevnetScreen() {
     }
   };
 
-  const clearWallet = () => {
-    clearPendingKey();
+  const clearWallet = async () => {
+    await clearPendingKey();
+    await clearSavedWalletAddress().catch((error: unknown) => {
+      console.warn('Could not clear the saved public wallet address.', error);
+    });
     setWalletAddress(null);
+    setWalletVerified(false);
     setBalance(null);
     setNotice({
       tone: 'info',
@@ -311,10 +389,15 @@ export default function WalletDevnetScreen() {
               <View style={styles.connectedWallet}>
                 <View style={styles.addressBlock}>
                   <Text style={[styles.cardEyebrow, { color: colors.mutedForeground }]}>
-                    CONNECTED PHANTOM WALLET
+                    {walletVerified ? 'CONNECTED PHANTOM WALLET' : 'SAVED WALLET ADDRESS'}
                   </Text>
                   <Text style={[styles.addressText, { color: colors.foreground }]}>
                     {shortenAddress(walletAddress)}
+                  </Text>
+                  <Text style={[styles.connectionBody, { color: colors.mutedForeground }]}>
+                    {walletVerified
+                      ? 'Approved by Phantom · read-only'
+                      : 'Reconnect to confirm the Phantom connection'}
                   </Text>
                 </View>
                 <Pressable
@@ -345,22 +428,44 @@ export default function WalletDevnetScreen() {
           </LinearGradient>
 
           {walletAddress ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Clear the local wallet connection"
-              testID="clear-wallet"
-              disabled={isBusy}
-              onPress={clearWallet}
-              style={({ pressed }) => [
-                styles.clearWalletButton,
-                { opacity: pressed || isBusy ? 0.55 : 1 },
-              ]}
-            >
-              <Feather name="log-out" size={14} color={colors.mutedForeground} />
-              <Text style={[styles.clearWalletText, { color: colors.mutedForeground }]}>
-                Clear local connection
-              </Text>
-            </Pressable>
+            <View style={styles.walletActions}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Reconnect Phantom wallet"
+                testID="reconnect-phantom"
+                disabled={isBusy}
+                onPress={() => void connectWallet()}
+                style={({ pressed }) => [
+                  styles.reconnectButton,
+                  { backgroundColor: colors.primary, opacity: pressed || isBusy ? 0.62 : 1 },
+                ]}
+              >
+                {busy === 'connect' ? (
+                  <ActivityIndicator size="small" color={colors.primaryForeground} />
+                ) : (
+                  <Feather name="refresh-cw" size={15} color={colors.primaryForeground} />
+                )}
+                <Text style={[styles.reconnectButtonText, { color: colors.primaryForeground }]}>
+                  {walletVerified ? 'Reconnect Phantom' : 'Verify with Phantom'}
+                </Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Clear the saved wallet address"
+                testID="clear-wallet"
+                disabled={isBusy}
+                onPress={() => void clearWallet()}
+                style={({ pressed }) => [
+                  styles.clearWalletButton,
+                  { borderColor: colors.border, opacity: pressed || isBusy ? 0.55 : 1 },
+                ]}
+              >
+                <Feather name="log-out" size={14} color={colors.mutedForeground} />
+                <Text style={[styles.clearWalletText, { color: colors.mutedForeground }]}>
+                  Clear
+                </Text>
+              </Pressable>
+            </View>
           ) : (
             <Pressable
               accessibilityRole="button"
@@ -748,8 +853,30 @@ const styles = StyleSheet.create({
     fontFamily: 'Inter_700Bold',
     textAlign: 'center',
   },
+  walletActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  reconnectButton: {
+    flex: 1,
+    minHeight: 46,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  reconnectButtonText: {
+    fontSize: 12,
+    fontFamily: 'Inter_700Bold',
+  },
   clearWalletButton: {
-    minHeight: 39,
+    minHeight: 46,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 10,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
