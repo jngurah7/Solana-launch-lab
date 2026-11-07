@@ -14,7 +14,7 @@ export interface PhantomKeyPair {
 }
 
 const PENDING_CONNECT_KEY = 'solana-launch-lab.pending-phantom-connect.v1';
-const PENDING_CONNECT_TTL_MS = 5 * 60 * 1000;
+const PENDING_CONNECT_TTL_MS = 15 * 60 * 1000;
 const PHANTOM_CONNECT_URL = 'https://phantom.com/ul/v1/connect';
 
 function encodeQuery(params: Record<string, string>): string {
@@ -57,9 +57,11 @@ async function storePendingKeyPair(keyPair: PhantomKeyPair): Promise<void> {
       throw new Error('Browser storage is unavailable. Please retry the Phantom connection.');
     }
     try {
-      window.sessionStorage.setItem(PENDING_CONNECT_KEY, record);
+      // Phantom may return to the app in a new Chrome tab. sessionStorage is
+      // tab-scoped, so use same-origin localStorage for this short-lived key.
+      window.localStorage.setItem(PENDING_CONNECT_KEY, record);
     } catch {
-      throw new Error('Temporary connection storage is unavailable. Please retry in a standard browser tab.');
+      throw new Error('Temporary connection storage is unavailable. Please allow site storage and retry.');
     }
     return;
   }
@@ -74,7 +76,7 @@ export async function restorePendingPhantomKeyPair(): Promise<PhantomKeyPair | n
   try {
     if (Platform.OS === 'web') {
       if (typeof window === 'undefined') return null;
-      stored = window.sessionStorage.getItem(PENDING_CONNECT_KEY);
+      stored = window.localStorage.getItem(PENDING_CONNECT_KEY);
     } else {
       stored = await SecureStore.getItemAsync(PENDING_CONNECT_KEY);
     }
@@ -113,7 +115,7 @@ export async function clearPendingPhantomKeyPair(): Promise<void> {
   if (Platform.OS === 'web') {
     if (typeof window === 'undefined') return;
     try {
-      window.sessionStorage.removeItem(PENDING_CONNECT_KEY);
+      window.localStorage.removeItem(PENDING_CONNECT_KEY);
     } catch {
       console.warn('Could not clear the temporary Phantom callback key from browser storage.');
     }

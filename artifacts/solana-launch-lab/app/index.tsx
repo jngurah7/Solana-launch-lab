@@ -166,7 +166,9 @@ export default function WalletDevnetScreen() {
       try {
         const keyPair = pendingKeyPair.current ?? await restorePendingPhantomKeyPair();
         if (!keyPair) {
-          throw new Error('The temporary Android callback expired. Please reconnect to Phantom.');
+          throw new Error(
+            'Phantom returned, but the temporary connection key was missing or expired. Start a fresh connection in this browser.',
+          );
         }
         pendingKeyPair.current = keyPair;
 
